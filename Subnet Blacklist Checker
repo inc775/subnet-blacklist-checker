@@ -1,0 +1,252 @@
+#!/usr/bin/env python3
+"""
+Subnet Blacklist Checker
+Checks all IPs in a subnet against DNS-based blacklists (DNSBLs)
+and the AbuseIPDB reputation API.
+
+Usage:
+    python subnet_blacklist_checker.py --subnet 192.168.1.0/16
+    python subnet_blacklist_checker.py --subnet 10.0.0.0/24 --abuseipdb-key YOUR_API_KEY
+    python subnet_blacklist_checker.py --subnet 10.0.0.0/16 --dnsbl-only
+    python subnet_blacklist_checker.py --subnet 10.0.0.0/16 --threads 200 --timeout 3
+"""
+
+import argparse
+import ipaddress
+import dns.resolver
+import requests
+import concurrent.futures
+import sys
+import time
+from dataclasses import dataclass, field
+from typing import Optional
+
+# ── DNSBLs to check ──────────────────────────────────────────────────────────
+DNSBL_ZONES = [
+    "zen.spamhaus.org",
+    "b.barracudacentral.org",
+    "bl.spamcop.net",
+    "dnsbl.sorbs.net",
+    "cbl.abuseat.org",
+    "dnsbl-1.uceprotect.net",
+    "psbl.surriel.com",
+    "ix.dnsbl.manitu.net",
+]
+
+# ── Configuration defaults ────────────────────────────────────────────────────
+DEFAULT_THREADS   = 100
+DEFAULT_TIMEOUT   = 3       # seconds per DNS query
+ABUSEIPDB_URL     = "https://api.abuseipdb.com/api/v2/check"
+ABUSEIPDB_DAYS    = 90      # look-back window
+
+
+# ── Result dataclass ──────────────────────────────────────────────────────────
+@dataclass
+class IPResult:
+    ip: str
+    dnsbl_hits: list[str]           = field(default_factory=list)
+    abuseipdb_score: Optional[int]  = None
+    abuseipdb_reports: Optional[int]= None
+    error: Optional[str]            = None
+
+    @property
+    def is_blacklisted(self) -> bool:
+        if self.dnsbl_hits:
+            return True
+        if self.abuseipdb_score is not None and self.abuseipdb_score > 0:
+            return True
+        return False
+
+
+# ── DNSBL check ───────────────────────────────────────────────────────────────
+def check_dnsbl(ip: str, zones: list[str], timeout: int) -> list[str]:
+    """Return the list of DNSBL zones that list this IP."""
+    # Reverse the IP octets for DNSBL lookup
+    reversed_ip = ".".join(reversed(ip.split(".")))
+    hits = []
+    resolver = dns.resolver.Resolver()
+    resolver.timeout = timeout
+    resolver.lifetime = timeout
+
+    for zone in zones:
+        query = f"{reversed_ip}.{zone}"
+        try:
+            resolver.resolve(query, "A")
+            hits.append(zone)
+        except (dns.resolver.NXDOMAIN, dns.resolver.NoAnswer):
+            pass  # Not listed
+        except dns.exception.Timeout:
+            pass  # Timed out — treat as not listed
+        except Exception:
+            pass
+
+    return hits
+
+
+# ── AbuseIPDB check ───────────────────────────────────────────────────────────
+def check_abuseipdb(ip: str, api_key: str, timeout: int) -> tuple[int, int]:
+    """
+    Returns (abuse_confidence_score, total_reports).
+    Raises on HTTP / API errors.
+    """
+    headers = {"Accept": "application/json", "Key": api_key}
+    params  = {"ipAddress": ip, "maxAgeInDays": ABUSEIPDB_DAYS}
+    resp = requests.get(ABUSEIPDB_URL, headers=headers, params=params, timeout=timeout)
+    resp.raise_for_status()
+    data = resp.json().get("data", {})
+    return data.get("abuseConfidenceScore", 0), data.get("totalReports", 0)
+
+
+# ── Per-IP worker ─────────────────────────────────────────────────────────────
+def check_ip(ip: str, zones: list[str], api_key: Optional[str],
+             timeout: int, dnsbl_only: bool) -> IPResult:
+    result = IPResult(ip=ip)
+
+    # DNSBL
+    if zones:
+        result.dnsbl_hits = check_dnsbl(ip, zones, timeout)
+
+    # AbuseIPDB
+    if api_key and not dnsbl_only:
+        try:
+            score, reports = check_abuseipdb(ip, api_key, timeout)
+            result.abuseipdb_score   = score
+            result.abuseipdb_reports = reports
+        except requests.exceptions.HTTPError as e:
+            result.error = f"AbuseIPDB HTTP error: {e}"
+        except Exception as e:
+            result.error = f"AbuseIPDB error: {e}"
+
+    return result
+
+
+# ── Progress / printing helpers ───────────────────────────────────────────────
+def print_result(r: IPResult) -> None:
+    if not r.is_blacklisted and not r.error:
+        return  # Silent for clean IPs
+
+    status_parts = []
+    if r.dnsbl_hits:
+        status_parts.append(f"DNSBL({', '.join(r.dnsbl_hits)})")
+    if r.abuseipdb_score is not None and r.abuseipdb_score > 0:
+        status_parts.append(f"AbuseIPDB(score={r.abuseipdb_score}, reports={r.abuseipdb_reports})")
+    if r.error:
+        status_parts.append(f"ERR:{r.error}")
+
+    tag = "🔴 LISTED" if r.is_blacklisted else "⚠️  ERROR "
+    print(f"  {tag}  {r.ip:<18}  {' | '.join(status_parts)}")
+
+
+def print_summary(results: list[IPResult], elapsed: float) -> None:
+    total     = len(results)
+    listed    = sum(1 for r in results if r.is_blacklisted)
+    errors    = sum(1 for r in results if r.error and not r.is_blacklisted)
+    clean     = total - listed - errors
+
+    print("\n" + "═" * 60)
+    print("  SCAN SUMMARY")
+    print("═" * 60)
+    print(f"  Total IPs scanned : {total:,}")
+    print(f"  ✅ Clean           : {clean:,}")
+    print(f"  🔴 Blacklisted     : {listed:,}")
+    print(f"  ⚠️  Errors          : {errors:,}")
+    print(f"  ⏱  Elapsed         : {elapsed:.1f}s")
+    print("═" * 60)
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Check every IP in a subnet against DNSBLs and/or AbuseIPDB."
+    )
+    parser.add_argument(
+        "--subnet", required=True,
+        help="CIDR subnet to scan, e.g. 192.168.0.0/16"
+    )
+    parser.add_argument(
+        "--abuseipdb-key", default=None,
+        help="AbuseIPDB API key (omit to skip AbuseIPDB checks)"
+    )
+    parser.add_argument(
+        "--dnsbl-only", action="store_true",
+        help="Skip AbuseIPDB even if a key is provided"
+    )
+    parser.add_argument(
+        "--threads", type=int, default=DEFAULT_THREADS,
+        help=f"Worker threads (default: {DEFAULT_THREADS})"
+    )
+    parser.add_argument(
+        "--timeout", type=int, default=DEFAULT_TIMEOUT,
+        help=f"DNS / HTTP timeout in seconds (default: {DEFAULT_TIMEOUT})"
+    )
+    parser.add_argument(
+        "--no-dnsbl", action="store_true",
+        help="Skip all DNSBL checks"
+    )
+    args = parser.parse_args()
+
+    # Resolve subnet
+    try:
+        network = ipaddress.ip_network(args.subnet, strict=False)
+    except ValueError as e:
+        print(f"[ERROR] Invalid subnet: {e}")
+        sys.exit(1)
+
+    zones = [] if args.no_dnsbl else DNSBL_ZONES
+    ip_list = [str(ip) for ip in network.hosts()]
+    total = len(ip_list)
+
+    # Print scan plan
+    print("═" * 60)
+    print("  SUBNET BLACKLIST CHECKER")
+    print("═" * 60)
+    print(f"  Subnet       : {network}")
+    print(f"  IPs to scan  : {total:,}")
+    print(f"  DNSBLs       : {len(zones)} zones" if zones else "  DNSBLs       : disabled")
+    print(f"  AbuseIPDB    : {'enabled' if args.abuseipdb_key and not args.dnsbl_only else 'disabled (no key or --dnsbl-only)'}")
+    print(f"  Threads      : {args.threads}")
+    print(f"  Timeout      : {args.timeout}s")
+    print("═" * 60)
+
+    # Warn for large /16 scans without an AbuseIPDB key
+    if total > 10_000 and args.abuseipdb_key and not args.dnsbl_only:
+        print("\n⚠️  WARNING: Scanning a /16 via AbuseIPDB will consume ~65,000 API credits.")
+        print("   AbuseIPDB free tier allows 1,000 checks/day.")
+        answer = input("   Continue anyway? [y/N]: ").strip().lower()
+        if answer != "y":
+            print("Aborted.")
+            sys.exit(0)
+
+    print(f"\nScanning… (only blacklisted IPs are shown)\n")
+
+    results: list[IPResult] = []
+    done = 0
+    start = time.time()
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=args.threads) as executor:
+        futures = {
+            executor.submit(
+                check_ip, ip, zones, args.abuseipdb_key, args.timeout, args.dnsbl_only
+            ): ip
+            for ip in ip_list
+        }
+
+        for future in concurrent.futures.as_completed(futures):
+            result = future.result()
+            results.append(result)
+            print_result(result)
+
+            done += 1
+            # Progress every 1,000 IPs
+            if done % 1_000 == 0 or done == total:
+                pct = done / total * 100
+                elapsed = time.time() - start
+                rate = done / elapsed if elapsed > 0 else 0
+                print(f"  [{done:,}/{total:,}] {pct:.1f}%  —  {rate:.0f} IPs/s", end="\r")
+
+    elapsed = time.time() - start
+    print_summary(results, elapsed)
+
+
+if __name__ == "__main__":
+    main()
